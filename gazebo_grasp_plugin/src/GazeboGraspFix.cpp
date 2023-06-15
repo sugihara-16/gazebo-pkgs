@@ -17,7 +17,7 @@ using gazebo::GzVector3;
 #define DEFAULT_UPDATE_RATE 5
 #define DEFAULT_MAX_GRIP_COUNT 10
 #define DEFAULT_RELEASE_TOLERANCE 0.005
-#define DEFAULT_DISABLE_COLLISIONS_ON_ATTACH false
+#define DEFAULT_DISABLE_COLLISIONS_ON_ATTACH true
 
 // Register this plugin with the simulator
 GZ_REGISTER_MODEL_PLUGIN(GazeboGraspFix)
@@ -71,6 +71,7 @@ void GazeboGraspFix::InitValues()
   //this->maxGripCount=floor(graspedSecs/timeDiff);
   //this->gripCountThreshold=floor(this->maxGripCount/2);
   this->node = transport::NodePtr(new transport::Node());
+  this->docking_cmd_sub = nh_.subscribe("docking_cmd", 1, &GazeboGraspFix::dockingCmdCallback, this);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -446,67 +447,11 @@ double AngularDistance(const GzVector3 &_v1,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Checks whether any two vectors in the set have an angle greater
-// than minAngleDiff (in rad), and one is at least
-// lengthRatio (0..1) of the other in it's length.
-bool CheckGrip(const std::vector<GzVector3> &forces,
-               float minAngleDiff, float lengthRatio)
-{
-  if (((lengthRatio > 1) || (lengthRatio < 0)) && (lengthRatio > 1e-04
-      && (fabs(lengthRatio - 1) > 1e-04)))
-  {
-    std::cerr << "ERROR: CheckGrip: always specify a lengthRatio of [0..1]" <<
-              std::endl;
-    return false;
-  }
-  if (minAngleDiff < M_PI_2)
-  {
-    std::cerr << "ERROR: CheckGrip: min angle must be at least 90 degrees (PI/2)" <<
-              std::endl;
-    return false;
-  }
-  std::vector<GzVector3>::const_iterator it1, it2;
-  for (it1 = forces.begin(); it1 != forces.end(); ++it1)
-  {
-    GzVector3 v1 = *it1;
-    for (it2 = it1 + 1; it2 != forces.end(); ++it2)
-    {
-      GzVector3 v2 = *it2;
-      float l1 = gazebo::GetLength(v1);
-      float l2 = gazebo::GetLength(v2);
-      if ((l1 < 1e-04) || (l2 < 1e-04)) continue;
-      /*GzVector3 _v1=v1;
-      GzVector3 _v2=v2;
-      _v1/=l1;
-      _v2/=l2;
-      float angle=acos(_v1.Dot(_v2));*/
-      float angle = AngularDistance(v1, v2);
-      // gzmsg<<"Angular distance between v1.len="<<v1.GetLength()<<" and v2.len="<<v2.GetLength()<<": "<<angle*180/M_PI<<std::endl;
-      if (angle > minAngleDiff)
-      {
-        float ratio;
-        if (l1 > l2) ratio = l2 / l1;
-        else ratio = l1 / l2;
-        // gzmsg<<"Got angle "<<angle<<", ratio "<<ratio<<std::endl;
-        if (ratio >= lengthRatio)
-        {
-          // gzmsg<<"CheckGrip() is true"<<std::endl;
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-////////////////////////////////////////////////////////////////////////////////
 void GazeboGraspFix::OnUpdate()
 {
   if ((common::Time::GetWallTime() - this->prevUpdateTime) < this->updateRate)
     return;
 
-  // first, copy all contact data into local struct. Don't do the complex grip check (CheckGrip)
-  // within the mutex, because that slows down OnContact().
   this->mutexContacts.lock();
   std::map<std::string, std::map<std::string, CollidingPoint> > contPoints(
     this->contacts);
@@ -519,7 +464,6 @@ void GazeboGraspFix::OnUpdate()
   // (and other useful information) for all the objects (so we have all forces on one object).
   std::map<std::string, std::map<std::string, CollidingPoint> >::iterator objIt;
   std::map<std::string, ObjectContactInfo> objectContactInfo;
-
   for (objIt = contPoints.begin(); objIt != contPoints.end(); ++objIt)
   {
     std::string objName = objIt->first;
@@ -580,9 +524,6 @@ void GazeboGraspFix::OnUpdate()
     // ------------------- 
 
     float minAngleDiff = this->forcesAngleTolerance; //120 * M_PI/180;
-    if (!CheckGrip(objContInfo.appliedForces, minAngleDiff, 0.3))
-      continue;
-
     // add to "gripped objects"
     grippedObjects.insert(objName);
 
@@ -590,7 +531,6 @@ void GazeboGraspFix::OnUpdate()
 
     int &counts = this->gripCounts[objName];
     if (counts < this->maxGripCount) ++counts;
-
     // only need to attach object if the grip count threshold is exceeded
     if (counts <= this->gripCountThreshold)
       continue;
@@ -602,9 +542,10 @@ void GazeboGraspFix::OnUpdate()
     std::string attachedToGripper;
     bool isAttachedToGripper = ObjectAttachedToGripper(objContInfo,
                                attachedToGripper);
-    if (isAttachedToGripper)
+    if (isAttachedToGripper || !this->attach_flag)
     {
-      // the object is already attached to a gripper, so it does not need to be attached.
+      // the object is already attached to a gripper, so it does not need to be attached,
+      // or the docking system is off.
       // gzmsg << "GazeboGraspFix has found that object "<<
       //     gripper.attachedObject()<<" is already attached to gripper "<<gripperName;
       continue;
@@ -671,55 +612,21 @@ void GazeboGraspFix::OnUpdate()
 
   // ++++++++++++++++++++ Handle Detachment  +++++++++++++++++++++++++++++++
   std::map<std::string, std::string> attachedObjects = GetAttachedObjects();
-
   // now, for all objects that are not currently gripped,
   // decrease grip counter, and possibly release object.
   std::map<std::string, int>::iterator gripCntIt;
   for (gripCntIt = this->gripCounts.begin(); gripCntIt != this->gripCounts.end();
        ++gripCntIt)
   {
-
+    if(this->attach_flag) continue;
+    
     const std::string &objName = gripCntIt->first;
-
-    if (grippedObjects.find(objName) != grippedObjects.end())
-    {
-      // this object is one we just detected as "gripped", so no need to check for releasing it...
-      // gzmsg<<"NOT considering "<<objName<<" for detachment."<<std::endl;
-      continue;
-    }
-
-    // the object does not satisfy "gripped" criteria, so potentially has to be released.
-
-    // gzmsg<<"NOT-GRIPPING "<<objName<<", grip count "<<gripCntIt->second<<" (threshold "<<this->gripCountThreshold<<")"<<std::endl;
-
-    if (gripCntIt->second > 0) --(gripCntIt->second);
 
     std::map<std::string, std::string>::iterator attIt = attachedObjects.find(
           objName);
-    bool isAttached = (attIt != attachedObjects.end());
-
-    // gzmsg<<"is attached: "<<isAttached<<std::endl;
-
-    if (!isAttached || (gripCntIt->second > this->gripCountThreshold)) continue;
 
     const std::string &graspingGripperName = attIt->second;
 
-    // gzmsg<<"Considering "<<objName<<" for detachment."<<std::endl;
-
-    // Object should potentially be detached now.
-    // However, this happens too easily when just considering the count, as the fingers
-    // in gazebo start wobbling as the arm moves around, and although they are still
-    // close to the object, the grip is not detected any more. So to be sure, we will
-    // check that the collision point (the place on the link where the contact originally
-    // was detected) has not moved too far from where it originally was, relative to the object.
-
-    // get the initial set of CollidingPoints for this object
-    // note that it is enough to use the initial contact points, because the object won't
-    // have "slipped" after being attached, and the location of the original contact point
-    // on the link itself is considered as a fixed point on the link, regardless whether this
-    // point is currently still colliding with the object or not. We only want to know whether
-    // this fixed point on the link has increased in distance from the corresponding fixed
-    // point (where the contact originally happened) on the object.
     std::map<std::string, std::map<std::string, CollidingPoint> >::iterator
     initCollIt = this->attachGripContacts.find(objName);
     if (initCollIt == this->attachGripContacts.end())
@@ -730,82 +637,26 @@ void GazeboGraspFix::OnUpdate()
     }
 
     std::map<std::string, CollidingPoint> &initColls = initCollIt->second;
-    int cntRelease = 0;
 
-    // for all links which have initially been detected to collide:
-    std::map<std::string, CollidingPoint>::iterator pointIt;
-    for (pointIt = initColls.begin(); pointIt != initColls.end(); ++pointIt)
-    {
-      CollidingPoint &cpInfo = pointIt->second;
-      // initial distance from link to contact point (relative to link)
-      GzVector3 relContactPos = cpInfo.pos / cpInfo.sum;
-      // Initial distance from link to object (relative to link)
-      GzVector3 relObjPos = cpInfo.objPos / cpInfo.sum;
-
-      // Get current world pose of object
-      GzPose3 currObjWorldPose =
-        gazebo::GetWorldPose(cpInfo.collObj->GetLink());
-
-      // Get world pose of link
-      GzPose3 currLinkWorldPose =
-        gazebo::GetWorldPose(cpInfo.collLink->GetLink());
-
-      // Get transform for currLinkWorldPose as matrix
-      GzMatrix4 worldToLink = gazebo::GetMatrix(currLinkWorldPose);
-
-      // Get the transform from collision link to contact point
-      GzMatrix4 linkToContact = gazebo::GetMatrix(relContactPos);
-
-      // The current world position of the contact point right now is:
-      GzMatrix4 _currContactWorldPose = worldToLink * linkToContact;
-      GzVector3 currContactWorldPose = gazebo::GetPos(_currContactWorldPose);
-
-      // The initial contact point location on the link should still correspond
-      // to the initial contact point location on the object.
-
-      // Initial vector from object center to contact point (relative to link,
-      // because relObjPos and relContactPos are from center of link)
-      GzVector3 oldObjDist = relContactPos - relObjPos;
-      // The same vector as \e oldObjDist, but calculated by the current world pose
-      // of object and the current location of the initial contact location on the link.
-      // This is the new distance from contact to object.
-      GzVector3 newObjDist = currContactWorldPose - gazebo::GetPos(currObjWorldPose);
-
-      //gzmsg<<"Obj Trans "<<cpInfo.collLink->GetName()<<": "<<relObjPos.x<<", "<<relObjPos.y<<", "<<relObjPos.z<<std::endl;
-      //gzmsg<<"Cont Trans "<<cpInfo.collLink->GetName()<<": "<<relContactPos.x<<", "<<relContactPos.y<<", "<<relContactPos.z<<std::endl;
-
-      // the difference between these vectors should not be too large...
-      float diff =
-        fabs(gazebo::GetLength(oldObjDist) - gazebo::GetLength(newObjDist));
-      //gzmsg<<"Diff for link "<<cpInfo.collLink->GetName()<<": "<<diff<<std::endl;
-
-      if (diff > releaseTolerance)
-      {
-        ++cntRelease;
-      }
-    }
-
-    if (cntRelease > 0)
-    {
-      // sufficient links did not meet the criteria to be close enough to the object.
-      // First, get the grasping gripper:
-      std::map<std::string, GazeboGraspGripper>::iterator gggIt = grippers.find(
-            graspingGripperName);
-      if (gggIt == grippers.end())
+    // sufficient links did not meet the criteria to be close enough to the object.
+    // First, get the grasping gripper:
+    std::map<std::string, GazeboGraspGripper>::iterator gggIt = grippers.find(
+                                                                              graspingGripperName);
+    if (gggIt == grippers.end())
       {
         gzerr << "GazeboGraspFix: Inconsistency: Gazebo gripper '" <<
-              graspingGripperName << "' not found when checking for detachment" << std::endl;
+          graspingGripperName << "' not found when checking for detachment" << std::endl;
         continue;
       }
-      GazeboGraspGripper &graspingGripper = gggIt->second;
-      // Now, detach the object:
-      gzmsg << "GazeboGraspFix: Detaching " << objName << " from gripper " <<
-            graspingGripperName << "." << std::endl;
-      graspingGripper.HandleDetach(objName);
-      this->OnDetach(objName, graspingGripperName);
-      gripCntIt->second = 0;
-      this->attachGripContacts.erase(initCollIt);
-    }
+
+    GazeboGraspGripper &graspingGripper = gggIt->second;
+    // Now, detach the object:
+    gzmsg << "GazeboGraspFix: Detaching " << objName << " from gripper " <<
+      graspingGripperName << "." << std::endl;
+    graspingGripper.HandleDetach(objName);
+    this->OnDetach(objName, graspingGripperName);
+    gripCntIt->second = 0;
+    this->attachGripContacts.erase(initCollIt);
   }
 
   this->prevUpdateTime = common::Time::GetWallTime();
@@ -979,3 +830,15 @@ void GazeboGraspFix::OnDetach(const std::string &objectName,
   event.set_attached(false);
   eventsPub->Publish(event);
 }
+
+void GazeboGraspFix::dockingCmdCallback(const std_msgs::Bool & msg)
+{
+  if(msg.data)
+    {
+      this->attach_flag = true;
+      gzmsg << "Attachment is activated!" << std::endl;
+    } else {
+    this->attach_flag = false;
+    gzmsg << "Attachment is inactivated!" << std::endl;
+  }
+};
