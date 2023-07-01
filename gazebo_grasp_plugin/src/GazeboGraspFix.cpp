@@ -71,7 +71,6 @@ void GazeboGraspFix::InitValues()
   //this->maxGripCount=floor(graspedSecs/timeDiff);
   //this->gripCountThreshold=floor(this->maxGripCount/2);
   this->node = transport::NodePtr(new transport::Node());
-  this->docking_cmd_sub = nh_.subscribe("docking_cmd", 1, &GazeboGraspFix::dockingCmdCallback, this);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -180,6 +179,11 @@ void GazeboGraspFix::Load(physics::ModelPtr _parent, sdf::ElementPtr _sdf)
     gzmsg << "GazeboGraspFix: Using release_tolerance " <<
           this->releaseTolerance << std::endl;
   }
+
+  //get robot namespace  and initialize ros subscriber
+  std::string robot_name = model->GetScopedName();
+  gzmsg << "GazeboGraspFix: Using robot namespace " << robot_name << std::endl;
+  this->docking_cmd_sub = nh_.subscribe(robot_name + "/docking_cmd", 1, &GazeboGraspFix::dockingCmdCallback, this);
 
   // will contain all names of collision entities involved from all arms
   std::vector<std::string> collisionNames;
@@ -800,7 +804,7 @@ void GazeboGraspFix::OnContact(const ConstContactsPtr &_msg)
           this->contacts[collidingObjName][collidingLink];  // inserts new entry if doesn't exist
         p.gripperName = gripperOfCollidingLink;
         p.collLink = linkCollision;
-        p.collObj = objCollision;
+       p.collObj = objCollision;
         p.force += avgForce;
         p.pos += contactPosInLocal;
         p.objPos += objPosInLocal;
